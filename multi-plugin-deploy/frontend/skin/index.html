@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PPI Calculator - Skin</title>
+    <style>
+      :root {
+        color: #1f2329;
+        background: #f7f8fa;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      .app {
+        box-sizing: border-box;
+        min-height: 100vh;
+        padding: 20px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: 0;
+      }
+
+      p {
+        margin: 0;
+        color: #646a73;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .panel {
+        display: grid;
+        gap: 10px;
+        margin-top: 24px;
+      }
+
+      button {
+        width: 100%;
+        min-height: 40px;
+        border: 1px solid #1456f0;
+        border-radius: 6px;
+        background: #1456f0;
+        color: #fff;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      button:hover {
+        background: #0f49d9;
+      }
+
+      button.secondary {
+        border-color: #d0d3d6;
+        background: #fff;
+        color: #1f2329;
+      }
+
+      button.secondary:hover {
+        background: #eff0f1;
+      }
+
+      .status {
+        margin-top: 16px;
+        min-height: 20px;
+        white-space: pre-wrap;
+      }
+
+      .hint {
+        margin-top: 12px;
+        color: #8f959e;
+        font-size: 12px;
+      }
+
+      code {
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <h1>PPI Calculator - Skin</h1>
+        <p id="context">Connecting to Base...</p>
+      </header>
+
+      <section class="panel">
+        <button id="run-selected" type="button">Update Selected Records</button>
+        <button id="run-view" type="button" class="secondary">Update Current View</button>
+      </section>
+
+      <p id="status" class="status">Ready.</p>
+      <p class="hint" id="hint"></p>
+    </main>
+
+    <script type="module">
+      import { bitable } from "https://unpkg.com/@lark-base-open/js-sdk@1.0.2/dist/index.mjs";
+
+      const params = new URLSearchParams(window.location.search);
+      const BACKEND_URL = params.get("backend") || `/skin/run-ppi`;
+      const TRIGGER_TOKEN = params.get("token") || "REPLACE_WITH_SKIN_TOKEN";
+      const PPI_TABLE_ID = params.get("table") || "tbl1YETqG5Hq91nA";
+
+      const contextEl = document.querySelector("#context");
+      const statusEl = document.querySelector("#status");
+      const hintEl = document.querySelector("#hint");
+      const runSelectedButton = document.querySelector("#run-selected");
+      const runViewButton = document.querySelector("#run-view");
+
+      let activeTableId = PPI_TABLE_ID;
+      let activeViewId = "";
+
+      hintEl.innerHTML = `Backend: <code>${BACKEND_URL}</code>`;
+
+      function setStatus(message) {
+        statusEl.textContent = message;
+      }
+
+      function setContext(message) {
+        contextEl.textContent = message;
+      }
+
+      function withTimeout(promise, ms, label) {
+        return Promise.race([
+          promise,
+          new Promise((_, reject) => {
+            window.setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+          }),
+        ]);
+      }
+
+      async function showToast(type, message) {
+        try {
+          await bitable.ui.showToast({ toastType: type, message });
+        } catch {
+          // Status text is the fallback.
+        }
+      }
+
+      async function refreshContext() {
+        try {
+          const selection = await withTimeout(
+            bitable.base.getSelection(),
+            3000,
+            "Reading Base context",
+          );
+
+          activeTableId = selection.tableId || PPI_TABLE_ID;
+          activeViewId = selection.viewId || "";
+
+          if (selection.tableId) {
+            const table = await bitable.base.getTableById(selection.tableId);
+            const tableName = await table.getName();
+            setContext(`Current table: ${tableName}`);
+            return true;
+          }
+        } catch (error) {
+          setContext("SDK context unavailable. Fallback table id from URL.");
+          setStatus(`SDK note: ${error.message}`);
+          return false;
+        }
+
+        setContext("Fallback table id from URL.");
+        return false;
+      }
+
+      async function postRunRequest(recordIds, mode) {
+        const response = await fetch(BACKEND_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-PPI-Trigger-Token": TRIGGER_TOKEN,
+          },
+          body: JSON.stringify({
+            mode,
+            table_id: activeTableId || PPI_TABLE_ID,
+            view_id: activeViewId || "",
+            record_ids: recordIds,
+          }),
+        });
+
+        const text = await response.text();
+        let data = {};
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = { raw: text };
+        }
+
+        if (!response.ok) {
+          throw new Error(data.error || text || `HTTP ${response.status}`);
+        }
+
+        return data;
+      }
+
+      async function runSelectedRecords() {
+        try {
+          setStatus("Opening record picker...");
+          await refreshContext();
+
+          const recordIds = await withTimeout(
+            bitable.ui.selectRecordIdList(activeTableId, activeViewId),
+            30000,
+            "Selecting records",
+          );
+
+          if (!recordIds.length) {
+            setStatus("No records selected.");
+            await showToast("info", "No records selected");
+            return;
+          }
+
+          setStatus(`Submitting ${recordIds.length} records...`);
+          const result = await postRunRequest(recordIds, "selected");
+          setStatus(`Submitted ${result.submitted} records.`);
+          await showToast("success", "PPI job submitted");
+        } catch (error) {
+          setStatus(`Selected mode failed: ${error.message}`);
+          await showToast("error", error.message);
+        }
+      }
+
+      async function runCurrentView() {
+        try {
+          setStatus("Submitting current view...");
+          await refreshContext();
+          const result = await postRunRequest([], "current_view");
+          setStatus(`Submitted ${result.submitted} records from current view.`);
+          await showToast("success", "Current view submitted");
+        } catch (error) {
+          setStatus(`Current view failed: ${error.message}`);
+          await showToast("error", error.message);
+        }
+      }
+
+      runSelectedButton.addEventListener("click", runSelectedRecords);
+      runViewButton.addEventListener("click", runCurrentView);
+
+      refreshContext();
+    </script>
+  </body>
+</html>

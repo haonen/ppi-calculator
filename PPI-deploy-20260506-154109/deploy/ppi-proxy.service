@@ -1,0 +1,15 @@
+[Unit]
+Description=PPI public proxy service
+After=network-online.target ppi-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ppi
+ExecStart=/opt/ppi/start_proxy_linux.sh
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

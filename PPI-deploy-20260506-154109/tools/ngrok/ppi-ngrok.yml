@@ -1,0 +1,9 @@
+version: 3
+
+endpoints:
+  - name: ppi-frontend
+    upstream:
+      url: 5173
+  - name: ppi-backend
+    upstream:
+      url: 8000

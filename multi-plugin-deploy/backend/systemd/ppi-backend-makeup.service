@@ -1,0 +1,17 @@
+[Unit]
+Description=PPI backend service - makeup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ppi
+EnvironmentFile=/opt/ppi/.env
+EnvironmentFile=/opt/ppi/env/ppi-makeup.env
+ExecStart=/opt/ppi/start_backend_linux.sh
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
