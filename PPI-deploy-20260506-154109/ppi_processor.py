@@ -110,6 +110,19 @@ Read the attached ecommerce window image and extract product and promotion infor
 
 Return only valid JSON. Do not wrap it in markdown. Use null when a value is not visible.
 Do not infer RSP or original price. Extract only what is visible in the image.
+Before product extraction, judge whether the image is usable for PPI calculation.
+Set image_readable_for_ppi = false only when BOTH conditions are true:
+1. The image does not contain enough readable product text to identify the actual beauty products,
+   product line, and SPU/category used for RSP matching.
+2. You cannot determine the products from visible packaging, nearby captions, brand context, or the
+   explicit rules in this prompt.
+Do not use this as a shortcut. If there is enough text/context to identify the products, even with
+some uncertainty, set image_readable_for_ppi = true and extract the best structured product list.
+When image_readable_for_ppi = false, set main_products = [], gift_products = [], and notes =
+"识图失败：图上没有可用于RSP匹配的明确产品名/系列SPU信息".
+Examples that may be unreadable: a decorative gift-box image that only says a collection/gift-box
+name such as "花如晓一醉花礼盒", shows stylized packaging, but does not provide matchable product
+SPU names or enough known context to identify the actual products behind each item.
 Output product names in Chinese. Visible image text has the highest priority.
 If the image visibly writes a product or gift name, copy that visible name exactly and do not replace it with a common nickname.
 This is especially important for gift_products. Example: if the gift text says "闪充棒", return product_name "闪充棒"; do not rewrite it as "红蛮腰次抛精华棒" or another inferred formal name.
@@ -177,6 +190,13 @@ Before extracting products, analyze the full image layout:
 STEP 2 - Product Information Extraction
 For each product, extract matching qualifiers when visible. These are used only for RSP matching
 and should be separate from the short product_name:
+- category: the product category/SPU class, such as 防晒, 精华, 面膜, 面霜, 水, 乳液,
+  眼霜, 洁面, 卸妆, 粉底, 气垫, 口红, 唇釉, 腮红, 眼影, 散粉, 眉笔, 睫毛膏.
+  Fill category for every main_product and gift_product whenever visible or inferable from the product name.
+- spec: the visible size/count must be attached to the exact product it belongs to.
+  If the image shows "40ml", "60ml", "100ml", "1.5ml*5", "5片", or similar near a product,
+  put that value in the product's spec and quantity/quantity_text. Do not leave spec null when the
+  size/count is visible anywhere in the product caption, packaging, or nearby list.
 - version: such as "1.0", "2.0", "3.0", "第三代"
 - variant: such as "干皮版", "油皮版", "滋润版", "轻盈版", "清爽版", "经典型", "轻润型"
 - shade: shade number or color name, such as "01", "象牙白", "粉色", "#01黄油可颂"
@@ -264,6 +284,8 @@ PROYA/珀莱雅 visual common-sense rules:
 
 Schema:
 {
+  "image_readable_for_ppi": true,
+  "readability_issue": null,
   "brand": null,
   "final_price": null,
   "currency": "CNY",
@@ -271,6 +293,7 @@ Schema:
   "main_products": [
     {
       "product_name": "中文产品名或中文昵称",
+      "category": null,
       "spec": null,
       "quantity": null,
       "quantity_text": null,
@@ -284,6 +307,7 @@ Schema:
   "gift_products": [
     {
       "product_name": "中文产品名或中文昵称",
+      "category": null,
       "spec": null,
       "quantity": null,
       "quantity_text": null,
@@ -304,6 +328,7 @@ Schema:
 @dataclass
 class RspEntry:
     brand: str
+    category: str
     product_name: str
     product_nickname: str
     spec: str
@@ -332,7 +357,8 @@ def loreal_client(config_id: str = VISION_CONFIG_ID) -> LorealGPTClient:
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
-    return re.sub(r"\s+", "", str(value).lower())
+    text = re.sub(r"\s+", "", str(value).lower())
+    return text.replace("菁华", "精华")
 
 
 QUALIFIER_RULES: list[tuple[str, list[str]]] = [
@@ -364,6 +390,7 @@ BRAND_ALIASES = {
     "lorealparis": ["lorealparis", "l'oréalparis", "欧莱雅"],
     "skinceuticals": ["skinceuticals", "修丽可"],
     "collgene": ["collgene", "可丽金", "可复美可丽金"],
+    "mistine": ["mistine", "蜜丝婷"],
 }
 
 
@@ -467,6 +494,36 @@ def parse_spec_amount(spec: Any) -> tuple[float, str] | None:
     return float(match.group(1)), unit
 
 
+def parse_total_spec_amount(spec: Any) -> tuple[float, str] | None:
+    if spec is None:
+        return None
+    text = str(spec).lower().replace("毫升", "ml").replace("克", "g")
+    normalized = text.replace("×", "*").replace("x", "*")
+    amount_times_count = re.search(
+        r"(\d+(?:\.\d+)?)\s*(ml|g|片|pcs|pc|支|只|条|颗|个|件|套)\s*\*\s*(\d+(?:\.\d+)?)",
+        normalized,
+        re.I,
+    )
+    if amount_times_count:
+        unit = amount_times_count.group(2)
+        if unit in {"pcs", "pc", "支", "只", "条", "颗", "个", "件", "套"}:
+            unit = "pcs"
+        return float(amount_times_count.group(1)) * float(amount_times_count.group(3)), unit
+
+    count_times_pack = re.search(
+        r"(\d+(?:\.\d+)?)\s*(片|pcs|pc|支|只|条|颗|个|件|套)\s*\*\s*(\d+(?:\.\d+)?)",
+        normalized,
+        re.I,
+    )
+    if count_times_pack:
+        unit = count_times_pack.group(2)
+        if unit in {"pcs", "pc", "支", "只", "条", "颗", "个", "件", "套"}:
+            unit = "pcs"
+        return float(count_times_pack.group(1)) * float(count_times_pack.group(3)), unit
+
+    return parse_spec_amount(spec)
+
+
 def infer_total_quantity_from_text(value: Any) -> float | None:
     text = str(value or "")
     if not text.strip():
@@ -539,6 +596,99 @@ def product_label(product: dict[str, Any]) -> str:
 
 def format_products(products: list[dict[str, Any]]) -> str:
     return "\n".join(product_label(product) for product in products if product)
+
+
+GENERIC_UNMATCHABLE_PRODUCT_NAMES = {
+    "洁面",
+    "洗面奶",
+    "水",
+    "爽肤水",
+    "柔肤水",
+    "精华水",
+    "乳",
+    "乳液",
+    "精华",
+    "精华液",
+    "面霜",
+    "霜",
+    "面膜",
+    "眼霜",
+    "防晒",
+    "唇膏",
+    "口红",
+}
+
+
+PACKAGING_ONLY_TOKENS = [
+    "礼盒",
+    "套盒",
+    "套装",
+    "礼包",
+    "组合",
+    "套组",
+]
+
+
+BEAUTY_CATEGORY_TOKENS = [
+    "洁面",
+    "洗面奶",
+    "水",
+    "爽肤水",
+    "柔肤水",
+    "精华水",
+    "乳",
+    "乳液",
+    "精华",
+    "精华液",
+    "面霜",
+    "霜",
+    "面膜",
+    "眼霜",
+    "防晒",
+    "粉底",
+    "气垫",
+    "口红",
+    "唇釉",
+    "腮红",
+    "眼影",
+    "散粉",
+    "眉笔",
+    "睫毛膏",
+    "香水",
+]
+
+
+def is_generic_unmatchable_product_name(value: Any) -> bool:
+    norm = normalize_text(value)
+    if not norm:
+        return True
+    return norm in {normalize_text(item) for item in GENERIC_UNMATCHABLE_PRODUCT_NAMES}
+
+
+def is_packaging_only_product_name(value: Any) -> bool:
+    norm = normalize_text(value)
+    if not norm:
+        return True
+    if not any(token in norm for token in PACKAGING_ONLY_TOKENS):
+        return False
+    return not any(token in norm for token in BEAUTY_CATEGORY_TOKENS)
+
+
+def recognition_failure_reason(extraction: dict[str, Any]) -> str | None:
+    readable = extraction.get("image_readable_for_ppi")
+    if isinstance(readable, bool) and not readable:
+        return "识图失败"
+
+    main_products = extraction.get("main_products") or []
+    if not main_products:
+        return "识图失败"
+
+    names = [product.get("product_name") for product in main_products]
+    if all(is_generic_unmatchable_product_name(name) for name in names):
+        return "识图失败"
+    if len(main_products) == 1 and is_packaging_only_product_name(names[0]):
+        return "识图失败"
+    return None
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -658,6 +808,7 @@ def normalize_extraction(data: dict[str, Any]) -> dict[str, Any]:
             data.get("brand"),
             product.get("product_name"),
         )
+        product["category"] = product.get("category") or product_category(product)
         ensure_product_quantity(product)
         apply_special_product_cases(product)
         product["match_qualifiers"] = product_match_qualifiers(product)
@@ -733,6 +884,68 @@ def product_match_qualifiers(product: dict[str, Any]) -> list[str]:
         for label in detected_qualifiers(value):
             add_unique(qualifiers, label)
     return qualifiers
+
+
+CATEGORY_RULES: list[tuple[str, list[str]]] = [
+    ("防晒", ["防晒", "spf", "sunscreen", "sunblock", "小黄帽"]),
+    ("洁面", ["洁面", "洗面奶", "cleanser"]),
+    ("卸妆", ["卸妆", "cleansing"]),
+    ("精华", ["精华", "精华液", "serum", "essence", "次抛", "安瓶"]),
+    ("面膜", ["面膜", "mask"]),
+    ("面霜", ["面霜", "cream", "霜"]),
+    ("乳液", ["乳液", "乳", "lotion", "emulsion"]),
+    ("水", ["爽肤水", "精华水", "柔肤水", "水", "toner"]),
+    ("眼霜", ["眼霜", "eyecream", "eye cream", "eye"]),
+    ("粉底", ["粉底", "foundation"]),
+    ("气垫", ["气垫", "cushion"]),
+    ("口红", ["口红", "唇膏", "lipstick"]),
+    ("唇釉", ["唇釉", "lip glaze"]),
+    ("腮红", ["腮红", "blush"]),
+    ("眼影", ["眼影", "eyeshadow"]),
+    ("散粉", ["散粉", "粉饼", "powder"]),
+    ("眉笔", ["眉笔", "eyebrow"]),
+    ("睫毛膏", ["睫毛膏", "mascara"]),
+    ("香水", ["香水", "perfume"]),
+]
+
+
+def infer_category_from_text(value: Any) -> str:
+    norm = normalize_text(value)
+    if not norm:
+        return ""
+    for label, aliases in CATEGORY_RULES:
+        if any(normalize_text(alias) and normalize_text(alias) in norm for alias in aliases):
+            return label
+    return ""
+
+
+def product_category(product: dict[str, Any]) -> str:
+    for value in [
+        product.get("category"),
+        product.get("product_name"),
+        product.get("raw_product_name"),
+        product.get("spec"),
+    ]:
+        category = infer_category_from_text(value)
+        if category:
+            return category
+    return ""
+
+
+def entry_category(entry: RspEntry) -> str:
+    for value in [entry.category, entry.product_nickname, entry.product_name, entry.spec]:
+        category = infer_category_from_text(value)
+        if category:
+            return category
+    return ""
+
+
+def same_category(product: dict[str, Any], entry: RspEntry) -> bool:
+    product_cat = product_category(product)
+    entry_cat = entry_category(entry)
+    if not product_cat or not entry_cat:
+        return False
+    return normalize_text(product_cat) == normalize_text(entry_cat)
 
 
 def qualifier_match_score(entry: RspEntry, qualifiers: list[str]) -> int:
@@ -876,17 +1089,23 @@ def build_rsp_entries(rsp_records: list[dict[str, Any]], rsp_column: str) -> lis
     entries: list[RspEntry] = []
     for record in rsp_records:
         fields = record.get("fields", {})
+        brand_parts = [
+            first_field(fields, ["英文品牌名", "English Brand", "Brand EN"]),
+            first_field(fields, ["中文品牌名", "Chinese Brand", "Brand CN"]),
+            first_field(fields, ["英文品牌名(中文品牌名)", "品牌", "品牌名", "Brand"]),
+        ]
+        brand = " ".join(str(part).strip() for part in brand_parts if str(part or "").strip())
         entries.append(
             RspEntry(
-                brand=str(
+                brand=brand,
+                category=str(
                     first_field(
                         fields,
                         [
-                            "英文品牌名(中文品牌名)",
-                            "英文品牌名",
-                            "品牌",
-                            "品牌名",
-                            "Brand",
+                            "品类",
+                            "产品品类",
+                            "类别",
+                            "Category",
                         ],
                     )
                     or ""
@@ -1057,6 +1276,10 @@ def product_total_spec_amount(product: dict[str, Any]) -> tuple[float, str] | No
     return spec[0] * quantity, spec[1]
 
 
+def entry_total_spec_amount(entry: RspEntry) -> tuple[float, str] | None:
+    return parse_total_spec_amount(entry.spec) or parse_total_spec_amount(entry.product_name)
+
+
 def product_pack_count(product: dict[str, Any]) -> float | None:
     quantity = parse_float(product.get("quantity"))
     if quantity and quantity > 1:
@@ -1074,7 +1297,7 @@ def is_pack_level_rsp_match(product: dict[str, Any], entry: RspEntry) -> bool:
     if product_count is not None and entry_count is not None and round(product_count, 6) == round(entry_count, 6):
         return True
     product_total_spec = product_total_spec_amount(product)
-    entry_total_spec = entry_spec_amount(entry)
+    entry_total_spec = entry_total_spec_amount(entry)
     return bool(product_total_spec and entry_total_spec and product_total_spec == entry_total_spec and (product_count or 0) > 1)
 
 
@@ -1146,7 +1369,7 @@ def qualifier_match_score_value(product: dict[str, Any], entry: RspEntry) -> flo
 
 def spec_match_score_value(product: dict[str, Any], entry: RspEntry) -> float:
     product_total_spec = product_total_spec_amount(product)
-    entry_total_spec = entry_spec_amount(entry)
+    entry_total_spec = entry_total_spec_amount(entry)
     if product_total_spec and entry_total_spec and product_total_spec == entry_total_spec:
         return 1.0
     product_count = product_pack_count(product)
@@ -1278,7 +1501,8 @@ def lookup_rsp_by_name_and_spec(
     entries: list[RspEntry],
 ) -> tuple[float | None, RspLookupNote | None]:
     product_name = product.get("product_name") or ""
-    product_spec = product_total_spec_amount(product)
+    product_spec = parse_spec_amount(product.get("spec")) or parse_spec_amount(product.get("matched_spec"))
+    product_total_spec = product_total_spec_amount(product)
     product_count = product_pack_count(product)
     requires_special = product_requires_proya_dual_special(product)
 
@@ -1301,10 +1525,24 @@ def lookup_rsp_by_name_and_spec(
     if not brand_candidates:
         return None, RspLookupNote("unmatched", product_label(product))
 
+    product_cat = product_category(product)
+    category_candidates = [
+        entry
+        for entry in brand_candidates
+        if product_cat and same_category(product, entry)
+    ]
+    detailed_candidate_pool = category_candidates or brand_candidates
+
     same_name_entries = nickname_entries or product_name_entries
+    if same_name_entries and category_candidates:
+        category_same_name_entries = [
+            entry for entry in same_name_entries if same_category(product, entry)
+        ]
+        if category_same_name_entries:
+            same_name_entries = category_same_name_entries
 
     if not same_name_entries:
-        tfidf_ranked = top_tfidf_candidates(product_name, brand_candidates, top_n=5)
+        tfidf_ranked = top_tfidf_candidates(product_name, detailed_candidate_pool, top_n=5)
         scored_candidates: list[tuple[RspEntry, float, float]] = []
         for entry, tfidf_score in tfidf_ranked:
             final_score = tfidf_score * 0.6 + spec_match_score_value(product, entry) * 0.3 + qualifier_match_score_value(product, entry) * 0.1
@@ -1315,13 +1553,18 @@ def lookup_rsp_by_name_and_spec(
             return None, RspLookupNote("unmatched", product_label(product))
 
         best_entry, best_tfidf_score, best_score = max(scored_candidates, key=lambda item: item[2])
+        if category_candidates and len(category_candidates) == 1 and best_score < 0.8:
+            return category_candidates[0].rsp, RspLookupNote(
+                "low_confidence",
+                f"{product_label(product)} 低置信匹配：品牌+品类候选唯一，匹配到 {entry_label(category_candidates[0])} (score={best_score:.2f})",
+            )
         if best_score < 0.5:
             if requires_special:
                 return None, RspLookupNote("unmatched", f"{product_label(product)}：需要匹配双抗3.0/特证版本，但RSP中未找到对应特证产品")
             return None, RspLookupNote("unmatched", f"{product_label(product)}：TF-IDF候选不足，最高分 {best_score:.2f}")
         if best_score < 0.8:
             return best_entry.rsp, RspLookupNote(
-                "conversion" if spec_match_score_value(product, best_entry) == 0 and product_spec else "matched",
+                "conversion" if spec_match_score_value(product, best_entry) == 0 and (product_total_spec or product_spec) else "matched",
                 f"{product_label(product)} 通过TF-IDF匹配到 {entry_label(best_entry)} (score={best_score:.2f}, tfidf={best_tfidf_score:.2f})",
             )
         return best_entry.rsp, None
@@ -1334,10 +1577,22 @@ def lookup_rsp_by_name_and_spec(
     same_name_entries = disambiguate_entries_with_qualifiers(product, same_name_entries)
 
     if product_spec:
+        exact_total_spec_entries = [
+            entry
+            for entry in same_name_entries
+            if product_total_spec and entry_total_spec_amount(entry) == product_total_spec
+        ]
+        if exact_total_spec_entries:
+            exact_total_spec_entries = disambiguate_entries_with_qualifiers(product, exact_total_spec_entries)
+            prices = price_values(exact_total_spec_entries)
+            if len(prices) == 1:
+                return exact_total_spec_entries[0].rsp, None
+            return None, RspLookupNote("unmatched", f"{product_label(product)}：{conflict_note(product, exact_total_spec_entries)}")
+
         exact_spec_entries = [
             entry
             for entry in same_name_entries
-            if entry_spec_amount(entry) == product_spec
+            if entry_spec_amount(entry) == product_spec and not entry_pack_count(entry)
         ]
         if exact_spec_entries:
             exact_spec_entries = disambiguate_entries_with_qualifiers(product, exact_spec_entries)
@@ -1370,13 +1625,13 @@ def lookup_rsp_by_name_and_spec(
         if compatible_entries:
             compatible_entries = disambiguate_entries_with_qualifiers(product, compatible_entries)
             unit_prices = {
-                round(entry.rsp / entry_spec_amount(entry)[0], 6)
+                round(entry.rsp / entry_total_spec_amount(entry)[0], 6)
                 for entry in compatible_entries
-                if entry_spec_amount(entry) and entry_spec_amount(entry)[0] > 0
+                if entry_total_spec_amount(entry) and entry_total_spec_amount(entry)[0] > 0
             }
             if len(unit_prices) == 1:
                 reference = compatible_entries[0]
-                reference_spec = entry_spec_amount(reference)
+                reference_spec = entry_total_spec_amount(reference)
                 unit_rsp = reference.rsp / reference_spec[0]
                 return (
                     unit_rsp * product_spec[0],
@@ -1401,18 +1656,20 @@ def product_rsp_total(
     quantity = parse_float(product.get("quantity")) or 1
     rsp, note = lookup_rsp_by_name_and_spec(product, brand, entries)
     if rsp is not None:
+        if has_pack_level_rsp_candidate(product, brand, entries, rsp):
+            quantity = 1
         return rsp * quantity, note
     return None, note or RspLookupNote("unmatched", product_label(product))
 
 
-def matched_entry_for_rsp(
+def matched_entries_for_rsp(
     product: dict[str, Any],
     brand: str,
     entries: list[RspEntry],
     rsp: float | None,
-) -> RspEntry | None:
+) -> list[RspEntry]:
     if rsp is None:
-        return None
+        return []
     product_name = product.get("product_name") or ""
     requires_special = product_requires_proya_dual_special(product)
     candidates: list[RspEntry] = []
@@ -1432,8 +1689,29 @@ def matched_entry_for_rsp(
         regular_candidates = [entry for entry in candidates if not entry_is_proya_dual_special(entry)]
         if regular_candidates:
             candidates = regular_candidates
-    candidates = disambiguate_entries_with_qualifiers(product, candidates)
+    return disambiguate_entries_with_qualifiers(product, candidates)
+
+
+def matched_entry_for_rsp(
+    product: dict[str, Any],
+    brand: str,
+    entries: list[RspEntry],
+    rsp: float | None,
+) -> RspEntry | None:
+    candidates = matched_entries_for_rsp(product, brand, entries, rsp)
     return candidates[0] if len(candidates) == 1 else None
+
+
+def has_pack_level_rsp_candidate(
+    product: dict[str, Any],
+    brand: str,
+    entries: list[RspEntry],
+    rsp: float | None,
+) -> bool:
+    return any(
+        is_pack_level_rsp_match(product, entry)
+        for entry in matched_entries_for_rsp(product, brand, entries, rsp)
+    )
 
 
 def format_spec_quantity(product: dict[str, Any]) -> str:
@@ -1566,6 +1844,7 @@ def parse_user_plv_details(value: Any) -> list[dict[str, Any]]:
     for product in products:
         product.setdefault("raw_product_name", product.get("product_name"))
         product["product_name"] = normalize_product_nickname("", product.get("product_name"))
+        product["category"] = product.get("category") or product_category(product)
         ensure_product_quantity(product)
         apply_special_product_cases(product)
         product["match_qualifiers"] = product_match_qualifiers(product)
@@ -1574,20 +1853,31 @@ def parse_user_plv_details(value: Any) -> list[dict[str, Any]]:
 
 def apply_user_filled_products(extraction: dict[str, Any], fields: dict[str, Any]) -> None:
     main_products = extraction.get("main_products") or []
-    user_products = split_multiline_value(user_field_value(fields, FIELD_PRODUCT))
+    user_products = [
+        parse_product_line(line) or {"product_name": re.sub(r"\[RSP（.*$", "", line).strip()}
+        for line in split_multiline_value(user_field_value(fields, FIELD_PRODUCT))
+    ]
     user_sizes = parse_user_size(user_field_value(fields, FIELD_SIZE))
 
     for index, product in enumerate(main_products):
         if index < len(user_products):
-            product["product_name"] = user_products[index]
-            product["raw_product_name"] = product.get("raw_product_name") or user_products[index]
+            user_product = user_products[index]
+            if user_product.get("product_name"):
+                product["product_name"] = user_product["product_name"]
+                product["raw_product_name"] = product.get("raw_product_name") or user_product["product_name"]
+            if user_product.get("spec") and not product.get("spec"):
+                product["spec"] = user_product["spec"]
+            if user_product.get("quantity") is not None and not parse_float(product.get("quantity")):
+                product["quantity"] = user_product["quantity"]
             product["product_name"] = normalize_product_nickname(extraction.get("brand"), product.get("product_name"))
+            product["category"] = product.get("category") or product_category(product)
             apply_special_product_cases(product)
         if index < len(user_sizes):
             user_size = user_sizes[index]
             if user_size.get("product_name"):
                 product["product_name"] = normalize_product_nickname(extraction.get("brand"), user_size.get("product_name"))
                 product["raw_product_name"] = product.get("raw_product_name") or user_size.get("product_name")
+                product["category"] = product.get("category") or product_category(product)
                 apply_special_product_cases(product)
             if user_size.get("spec"):
                 product["spec"] = user_size["spec"]
@@ -1609,10 +1899,15 @@ def lookup_line_item(
     matched_entry = matched_entry_for_rsp(product, brand, entries, rsp)
     if matched_entry and not parse_spec_amount(product.get("spec")):
         product["matched_spec"] = product.get("matched_spec") or matched_entry.spec
-    pricing_quantity = 1 if matched_entry and is_pack_level_rsp_match(product, matched_entry) else quantity
+    pricing_quantity = 1 if has_pack_level_rsp_candidate(product, brand, entries, rsp) else quantity
     status = "未查询到数据"
     if rsp is not None:
-        status = "折算" if note and note.kind == "conversion" else "匹配"
+        if note and note.kind == "conversion":
+            status = "折算"
+        elif note and note.kind == "low_confidence":
+            status = "低置信匹配"
+        else:
+            status = "匹配"
     total = rsp * pricing_quantity if rsp is not None else None
     return {
         "product": product,
@@ -1626,6 +1921,10 @@ def lookup_line_item(
 
 
 def format_plv_details(items: list[dict[str, Any]]) -> str:
+    return format_line_item_details(items)
+
+
+def format_line_item_details(items: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for item in items:
         product = item["product"]
@@ -1672,6 +1971,7 @@ def calculate_rsp(
     main_totals = [item["total"] for item in main_items if item["total"] is not None]
     gift_totals = [item["total"] for item in gift_items if item["total"] is not None]
     conversion_notes: list[str] = []
+    low_confidence_notes: list[str] = []
     unmatched_notes: list[str] = []
     other_notes: list[str] = []
 
@@ -1681,6 +1981,8 @@ def calculate_rsp(
             unmatched_notes.append(note.text if note else product_label(item["product"]))
         elif note and note.kind == "conversion":
             conversion_notes.append(note.text)
+        elif note and note.kind == "low_confidence":
+            low_confidence_notes.append(note.text)
     if ignored_gwps:
         other_notes.append("未计入PPI的GWP周边：" + "；".join(product_label(product) for product in ignored_gwps))
 
@@ -1689,9 +1991,9 @@ def calculate_rsp(
     hero_total = hero_amount(main_products, gift_products)
     if main_products and hero_total is None:
         other_notes.append("橱窗图未识别到主品毫升数/克数/片数，无法计算hero ml/pcs及hero price per ml/pcs")
-    note_text = render_ppi_note(conversion_notes, unmatched_notes, other_notes)
+    note_text = render_ppi_note(conversion_notes, unmatched_notes, [*other_notes, *low_confidence_notes])
     base_result = {
-        "product": product_name_summary(main_products),
+        "product": format_line_item_details(main_items),
         "size": size_summary(main_products),
         "plv_details": format_plv_details(gift_items),
         "hero_amount": hero_total,
@@ -1709,14 +2011,14 @@ def calculate_rsp(
             "ppi": None,
         }
     if not final_price:
-        return {**base_result, "can_calculate": False, "note": render_ppi_note(conversion_notes, [], [*other_notes, "到手价未识别"])}
+        return {**base_result, "can_calculate": False, "note": render_ppi_note(conversion_notes, [], [*other_notes, *low_confidence_notes, "到手价未识别"])}
     if not total_rsp:
-        return {**base_result, "can_calculate": False, "note": render_ppi_note(conversion_notes, [], [*other_notes, "总RSP为空"])}
+        return {**base_result, "can_calculate": False, "note": render_ppi_note(conversion_notes, [], [*other_notes, *low_confidence_notes, "总RSP为空"])}
 
     return {
         **base_result,
         "can_calculate": True,
-        "needs_review": bool(conversion_notes),
+        "needs_review": bool(conversion_notes or low_confidence_notes),
         "ppi": final_price / total_rsp * 100,
         "note": note_text,
     }
@@ -1746,6 +2048,16 @@ def process_record(
 
     extraction, raw, method = extract_product_info(link)
     apply_user_filled_products(extraction, fields)
+    failure_reason = recognition_failure_reason(extraction)
+    if failure_reason:
+        output = {
+            FIELD_PRODUCT: product_name_summary(extraction.get("main_products") or []),
+            FIELD_NOTE: failure_reason,
+            FIELD_STATUS: "Needs review",
+        }
+        mapped_output = map_output_fields(output, field_map or {})
+        return coerce_output_for_field_types(mapped_output, field_types)
+
     user_actual_price = parse_float(user_field_value(fields, FIELD_ACTUAL_PRICE))
     if user_actual_price is not None:
         extraction["final_price"] = user_actual_price
